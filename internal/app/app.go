@@ -109,21 +109,11 @@ func New(cfg *config.Config, logger *slog.Logger) (_ *App, err error) {
 	exportMgr := export.NewManager(export.Config{
 		EmbyDir: cfg.EmbyDir, PublicURL: cfg.PublicURL, STRMToken: cfg.STRMToken,
 	})
-	playSvc := playback.New(store.Client, driveSvc, 8*time.Hour)
+	playSvc := playback.New(store.Client, driveSvc, 8*time.Hour, sourceSvc.LocalRoots)
 	libSvc := library.New(store.Client, driveSvc, taskSvc, images, library.Options{
 		ExportManager: exportMgr,
 		Sources:       sourceSvc.LibrarySources,
-		LocalSources: func(ctx context.Context) ([]library.LocalScanTarget, error) {
-			targets, err := sourceSvc.LocalTargets(ctx)
-			if err != nil {
-				return nil, err
-			}
-			result := make([]library.LocalScanTarget, 0, len(targets))
-			for _, target := range targets {
-				result = append(result, library.LocalScanTarget{Path: target.Path, MetadataOnly: target.MetadataOnly})
-			}
-			return result, nil
-		},
+		LocalSources:  sourceSvc.LocalTargets,
 	})
 	javbusClient, err := javbus.New(javbus.Options{Proxy: networkSvc.ProxyManager()})
 	if err != nil {
@@ -150,8 +140,10 @@ func New(cfg *config.Config, logger *slog.Logger) (_ *App, err error) {
 	}
 	cleanup = append(cleanup, catalogueSvc.Close)
 	proxy := networkSvc.ProxyManager()
+	// FANZA also lists followed actresses' works; metadata closes it.
+	fanza := providers.NewFANZA(proxy)
 	metadataSvc, err := metadata.New(ctx, store.Client,
-		providers.NewFANZA(proxy),
+		fanza,
 		providers.NewFC2(proxy),
 		providers.NewFC2DB(proxy),
 		providers.NewHEYZO(proxy),
@@ -181,7 +173,6 @@ func New(cfg *config.Config, logger *slog.Logger) (_ *App, err error) {
 	cleanup = append(cleanup, metadataSvc.Close)
 
 	offlineSvc := offline.New(store.Client, catalogueSvc, driveSvc, taskSvc, libSvc, metadataSvc, offlineSubmitTimeout)
-	monitorSvc := monitor.New(store.Client, catalogueSvc, offlineSvc, taskSvc)
 	gfriendsClient := gfriends.New(cfg.DataDir, &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: netx.NewTransport(networkSvc.ProxyManager()),
@@ -193,6 +184,7 @@ func New(cfg *config.Config, logger *slog.Logger) (_ *App, err error) {
 		netx.NewSafeDownloadClient(networkSvc.ProxyManager(), 30*time.Second),
 		actors.NewAVLeague(networkSvc.ProxyManager()),
 	)
+	monitorSvc := monitor.New(store.Client, catalogueSvc, fanza, followedActor(actorsSvc), taskSvc)
 	syncActors := cfg.EmbySyncActors
 	embySvc, err := emby.NewService(ctx, store.Client, emby.Config{
 		Enabled:    cfg.EmbyEnabled,
@@ -227,7 +219,6 @@ func New(cfg *config.Config, logger *slog.Logger) (_ *App, err error) {
 
 	taskRegistry.Register(tasks.NewHandler(tasks.KindScan, libSvc.Scan, libSvc.Finished).WithRetry(domain.RetryDelay))
 	taskRegistry.Register(tasks.NewHandler(tasks.KindScrape, scrapeSvc.Scrape, scrapeSvc.Finished).WithRetry(domain.RetryDelay))
-	taskRegistry.Register(tasks.NewHandler(tasks.KindSubscriptionBatch, monitorSvc.BatchHandler, monitorSvc.BatchFinished))
 
 	pools := newTaskPools(taskSvc, logger)
 
@@ -242,9 +233,10 @@ func New(cfg *config.Config, logger *slog.Logger) (_ *App, err error) {
 		Library:        libSvc,
 		Play:           playSvc,
 		STRM:           strm.New(store.Client, driveSvc),
-		Tasks:          &taskViews{Service: taskSvc, database: store.Client, library: libSvc, monitor: monitorSvc},
+		Tasks:          &taskViews{Service: taskSvc, database: store.Client, library: libSvc},
 		Artwork:        scrapeSvc,
 		Maintenance:    maintenanceSvc,
+		Logs:           maintenanceSvc,
 		Network:        networkSvc,
 		Emby:           embySvc,
 		Sources:        sourceSvc,
@@ -315,10 +307,10 @@ func (a *App) Run(ctx context.Context) error {
 		})
 	}
 	workers.Go(func() {
-		tasks.RunPeriodic(ctx, a.logger, "sync 115 offline tasks", offlineSyncInterval, nil, a.offline.Sync)
+		tasks.RunPeriodic(ctx, a.logger, "sync 115 offline tasks", offlineSyncInterval, a.offline.Pending(), a.offline.Sync)
 	})
 	workers.Go(func() {
-		tasks.RunPeriodic(ctx, a.logger, "monitor", monitorCheckInterval, a.monitors.Pending(), a.monitors.Check)
+		tasks.RunPeriodic(ctx, a.logger, "monitor", monitorCheckInterval, nil, a.monitors.Check)
 	})
 
 	serverError := make(chan error, 1)

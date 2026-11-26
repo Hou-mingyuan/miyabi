@@ -15,6 +15,7 @@ import (
 	"github.com/ppxb/miyabi/internal/ent"
 	"github.com/ppxb/miyabi/internal/ent/file"
 	"github.com/ppxb/miyabi/internal/ent/movie"
+	"github.com/ppxb/miyabi/internal/ent/predicate"
 	"github.com/ppxb/miyabi/internal/export"
 	mediaimage "github.com/ppxb/miyabi/internal/image"
 	"github.com/ppxb/miyabi/internal/nfo"
@@ -50,9 +51,10 @@ type MetadataSource interface {
 }
 
 // Notifier reports committed library updates and queued follow-up work.
+// WakePool with no kinds wakes every worker.
 type Notifier interface {
 	NotifyLibraryChanged()
-	WakePool()
+	WakePool(...tasks.Kind)
 }
 
 // SubtitleExporter copies a movie's downloaded subtitles beside its exported .strm file.
@@ -156,9 +158,16 @@ func (service *Service) Scrape(ctx context.Context, job tasks.Job) error {
 		return nil
 	}
 	input.Code = codeid.Normalize(input.Code)
-	sess, err := service.begin(ctx, input.MetadataPayload)
-	if err != nil {
-		return err
+	// Local files are read from disk and need no 115 session.
+	local := input.Source.AccountID == domain.LocalAccountID
+	var sess drive.Session
+	commit := func(fn func(*ent.Tx) error) error { return ent.WithTx(ctx, service.db, fn) }
+	if !local {
+		sess, err = service.begin(ctx, input.MetadataPayload)
+		if err != nil {
+			return err
+		}
+		commit = func(fn func(*ent.Tx) error) error { return sess.Commit(ctx, fn) }
 	}
 	current, err := service.db.Movie.Query().Where(movie.IDEQ(input.MovieID)).Select(movie.FieldID, movie.FieldManualCode).Only(ctx)
 	if err != nil {
@@ -168,7 +177,7 @@ func (service *Service) Scrape(ctx context.Context, job tasks.Job) error {
 		return domain.E(domain.KindConflict, "影片番号已纠正，请使用新的刮削任务", nil)
 	}
 	if !input.MetadataReady {
-		if err := service.prepareMetadata(ctx, sess, job.ID, &input); err != nil {
+		if err := service.prepareMetadata(ctx, commit, job.ID, &input); err != nil {
 			return err
 		}
 	}
@@ -181,7 +190,12 @@ func (service *Service) Scrape(ctx context.Context, job tasks.Job) error {
 	if err := tasks.Checkpoint(ctx, service.db); err != nil {
 		return err
 	}
-	if err := service.publishMovie(ctx, sess, job, input); err != nil {
+	if local {
+		err = service.publishLocal(ctx, job, input)
+	} else {
+		err = service.publishMovie(ctx, sess, job, input)
+	}
+	if err != nil {
 		return err
 	}
 	// Subtitles are picked by the user; re-exporting only restores their copies.
@@ -193,13 +207,16 @@ func (service *Service) Scrape(ctx context.Context, job tasks.Job) error {
 	return nil
 }
 
-func (service *Service) prepareMetadata(ctx context.Context, sess drive.Session, taskID int, input *Payload) error {
+func (service *Service) prepareMetadata(ctx context.Context, commit func(func(*ent.Tx) error) error, taskID int, input *Payload) error {
 	record, err := service.db.Movie.Query().Where(movie.IDEQ(input.MovieID),
-		movie.HasFilesWith(database.LibraryFiles(input.Source))).Only(ctx)
+		movie.HasFilesWith(movieFiles(input.Source))).Only(ctx)
 	if err != nil {
 		return fmt.Errorf("load indexed movie for metadata: %w", err)
 	}
-	if record.ScrapeStatus == movie.ScrapeStatusDone && !input.Rebuild {
+	// A completed movie keeps its saved metadata and its done status, so a
+	// failed re-export does not turn it into a pending or failed movie.
+	reused := record.ScrapeStatus == movie.ScrapeStatusDone && !input.Rebuild
+	if reused {
 		input.Document, err = MovieNFO(record)
 		if err != nil {
 			return err
@@ -227,13 +244,18 @@ func (service *Service) prepareMetadata(ctx context.Context, sess drive.Session,
 	if err != nil {
 		return err
 	}
-	if err := sess.Commit(ctx, func(tx *ent.Tx) error {
-		if err := SaveMovieMetadata(ctx, tx, input.MovieID, input.Document); err != nil {
-			return err
+	if err := commit(func(tx *ent.Tx) error {
+		if !reused {
+			if err := SaveMovieMetadata(ctx, tx, input.MovieID, input.Document); err != nil {
+				return err
+			}
 		}
 		return tx.Task.UpdateOneID(taskID).SetPayload(encoded).Exec(ctx)
 	}); err != nil {
 		return fmt.Errorf("save movie metadata checkpoint: %w", err)
+	}
+	if reused {
+		return nil
 	}
 	if service.notifier != nil {
 		service.notifier.NotifyLibraryChanged()
@@ -260,7 +282,7 @@ func (service *Service) Finished(ctx context.Context, tx *ent.Tx, job tasks.Job,
 	update := tx.Movie.Update().Where(
 		movie.IDEQ(input.MovieID),
 		movie.ManualCodeEQ(input.ManualCode),
-		movie.HasFilesWith(database.LibraryFiles(input.Source)),
+		movie.HasFilesWith(movieFiles(input.Source)),
 	)
 	if !input.Rebuild {
 		update.Where(movie.ScrapeStatusNEQ(movie.ScrapeStatusDone))
@@ -269,6 +291,15 @@ func (service *Service) Finished(ctx context.Context, tx *ent.Tx, job tasks.Job,
 		return 0, err
 	}
 	return tasks.ChangeLibrary, nil
+}
+
+// movieFiles scopes a movie's indexed files to the job's source. Local scans
+// index every directory under one shared root, unlike mounted 115 sources.
+func movieFiles(source domain.LibrarySource) predicate.File {
+	if source.AccountID == domain.LocalAccountID {
+		return file.AccountIDEQ(domain.LocalAccountID)
+	}
+	return database.LibraryFiles(source)
 }
 
 // MovieDirectory groups a movie's indexed videos with the current directory listing.
@@ -280,6 +311,10 @@ type MovieDirectory struct {
 
 // Directories returns all directories containing media files for the movie.
 func (service *Service) Directories(ctx context.Context, sess drive.Session, input MetadataPayload) ([]MovieDirectory, error) {
+	return service.movieDirectories(ctx, sess, input, false)
+}
+
+func (service *Service) movieDirectories(ctx context.Context, sess drive.Session, input MetadataPayload, refresh bool) ([]MovieDirectory, error) {
 	files, err := service.db.File.Query().Where(database.LibraryFiles(input.Source), file.MovieIDEQ(input.MovieID)).
 		Order(ent.Asc(file.FieldParentID), ent.Asc(file.FieldFileID)).All(ctx)
 	if err != nil {
@@ -301,27 +336,44 @@ func (service *Service) Directories(ctx context.Context, sess drive.Session, inp
 	}
 	for i := range result {
 		directory := &result[i]
-		directory.Files, err = service.directoryEntries(ctx, sess, directory.ID)
+		files, cached, err := service.loadDirectoryEntries(ctx, sess, directory.ID, refresh)
 		if err != nil {
 			return nil, fmt.Errorf("read metadata directory: %w", err)
 		}
-		present := 0
-		for _, entry := range directory.Files {
-			if !entry.IsDirectory && domain.IsVideo(entry.Name) && entry.Size >= domain.MinVideoSize {
-				if directory.VideoIDs[entry.ID] {
-					present++
-				}
+		if cached && !allVideosPresent(files, directory.VideoIDs) {
+			files, _, err = service.loadDirectoryEntries(ctx, sess, directory.ID, true)
+			if err != nil {
+				return nil, fmt.Errorf("read metadata directory: %w", err)
 			}
 		}
-		if present == 0 {
+		if !allVideosPresent(files, directory.VideoIDs) {
 			return nil, domain.E(domain.KindNotFound, "视频文件已删除或移动，请重新扫描", nil)
 		}
+		directory.Files = files
 	}
 	return result, nil
 }
 
+func allVideosPresent(files []pan.File, videoIDs map[string]bool) bool {
+	if len(videoIDs) == 0 {
+		return false
+	}
+	matched := make(map[string]bool, len(videoIDs))
+	for _, entry := range files {
+		if !entry.IsDirectory && domain.IsVideo(entry.Name) && entry.Size >= domain.MinVideoSize && videoIDs[entry.ID] {
+			matched[entry.ID] = true
+		}
+	}
+	return len(matched) == len(videoIDs)
+}
+
 // directoryEntries retrieves directory entries using a short-lived cache to avoid redundant pagination of large folders.
 func (service *Service) directoryEntries(ctx context.Context, sess drive.Session, dirID string) ([]pan.File, error) {
+	files, _, err := service.loadDirectoryEntries(ctx, sess, dirID, false)
+	return files, err
+}
+
+func (service *Service) loadDirectoryEntries(ctx context.Context, sess drive.Session, dirID string, refresh bool) ([]pan.File, bool, error) {
 	key := dirID
 	if src := sess.Source(); src.AccountID != "" {
 		key = src.AccountID + ":" + dirID
@@ -329,23 +381,28 @@ func (service *Service) directoryEntries(ctx context.Context, sess drive.Session
 
 	service.dirMu.Lock()
 	service.pruneDirCache(time.Now())
-	entry, ok := service.dirCache[key]
-	service.dirMu.Unlock()
-	if ok {
-		return slices.Clone(entry.files), nil
+	if refresh {
+		delete(service.dirCache, key)
+	} else if entry, ok := service.dirCache[key]; ok {
+		service.dirMu.Unlock()
+		return slices.Clone(entry.files), true, nil
 	}
+	service.dirMu.Unlock()
 
 	files, err := drive.DirectoryEntries(ctx, sess, dirID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// Large directories are still read in full, but must not displace the entire cache.
 	if len(files) > maxDirCacheFiles {
-		return files, nil
+		return files, false, nil
 	}
 
 	service.dirMu.Lock()
 	now := time.Now()
+	if service.dirCache == nil {
+		service.dirCache = make(map[string]dirCacheEntry)
+	}
 	service.dirCache[key] = dirCacheEntry{
 		files:     files,
 		expiresAt: now.Add(defaultDirCacheTTL),
@@ -353,7 +410,7 @@ func (service *Service) directoryEntries(ctx context.Context, sess drive.Session
 	service.pruneDirCache(now)
 	service.dirMu.Unlock()
 
-	return slices.Clone(files), nil
+	return slices.Clone(files), false, nil
 }
 
 // pruneDirCache reclaims expired listings and evicts the oldest listings when over budget.

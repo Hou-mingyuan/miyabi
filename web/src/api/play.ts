@@ -3,8 +3,6 @@ import { useEffect } from 'react'
 
 import { apiDelete, apiGet, apiPost } from '@/api/client'
 
-export type PlayFile = { id: string; name: string; path: string; size: number }
-
 export type PlaySource = { src: string; type: string; label: string }
 
 // Unified, extensible per-movie playback preferences. Future preferences
@@ -74,6 +72,13 @@ export function usePlayQualities(fileID: string | undefined, enabled: boolean) {
   }, [id])
 
   return query
+}
+
+export type MpvLink = { url: string }
+
+/** Build the miyabi-mpv:// deep link for a movie's primary file and subtitle. */
+export function fetchMpvLink(movieID: number) {
+  return apiGet<MpvLink>('/api/mpv-link', { movie_id: movieID })
 }
 
 export function useStartMoviePlayback(movieID: number | null) {

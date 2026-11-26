@@ -24,6 +24,7 @@ import (
 	"github.com/ppxb/miyabi/internal/export"
 	mediaimage "github.com/ppxb/miyabi/internal/image"
 	"github.com/ppxb/miyabi/internal/library/scan"
+	"github.com/ppxb/miyabi/internal/magnet"
 	"github.com/ppxb/miyabi/internal/syncx"
 	"github.com/ppxb/miyabi/internal/tasks"
 )
@@ -64,6 +65,10 @@ type Movie struct {
 	// HasSubtitle marks movies whose file or indexed subtitle names indicate a
 	// Chinese-subtitle release.
 	HasSubtitle bool `json:"has_subtitle"`
+	// HasUncensored marks movies whose file names indicate an uncensored release.
+	HasUncensored bool `json:"has_uncensored,omitempty"`
+	// HasCracked marks movies whose file names indicate a cracked/leaked release.
+	HasCracked bool `json:"has_cracked,omitempty"`
 	// Finished marks movies whose saved playback position reached the end.
 	Finished bool `json:"finished,omitempty"`
 }
@@ -113,13 +118,7 @@ type Service struct {
 	exportMgr    *export.Manager
 	scanLock     syncx.ContextLock
 	sources      func(context.Context) ([]domain.LibrarySource, error)
-	localSources func(context.Context) ([]LocalScanTarget, error)
-}
-
-// LocalScanTarget is an enabled local source directory and its metadata mode.
-type LocalScanTarget struct {
-	Path         string
-	MetadataOnly bool
+	localSources func(context.Context) ([]domain.LocalScanTarget, error)
 }
 
 type Options struct {
@@ -127,7 +126,7 @@ type Options struct {
 	// Sources supplies the enabled cloud sources to aggregate in the library.
 	Sources func(context.Context) ([]domain.LibrarySource, error)
 	// LocalSources supplies the enabled local source directories.
-	LocalSources func(context.Context) ([]LocalScanTarget, error)
+	LocalSources func(context.Context) ([]domain.LocalScanTarget, error)
 	// Pacing defaults to scan.DefaultPacing; tests can provide a no-op.
 	Pacing func(context.Context) error
 }
@@ -181,8 +180,8 @@ func (s *Service) StartRebuild(ctx context.Context) (domain.TaskInfo, error) {
 }
 
 // enqueueAllScans queues a full scan (or rebuild) for every enabled source:
-// configured local directories and each mounted 115 account, plus the current
-// primary mount. It reports the first queued task and whether anything was
+// configured local directories and enabled 115 sources. It reports the first
+// queued task and whether anything was
 // configured, so callers can fall back to the single primary mount only when no
 // sources exist. This keeps multi-account and local-only setups from needlessly
 // requiring one specific 115 account to be logged in.
@@ -213,7 +212,15 @@ func (s *Service) enqueueAllScans(ctx context.Context, rebuild bool) (domain.Tas
 	}
 
 	var cloud []domain.LibrarySource
-	if s.drive != nil {
+	if s.sources != nil {
+		list, err := s.sources(ctx)
+		if err != nil {
+			return first, queued, err
+		}
+		cloud = list
+	} else if s.drive != nil {
+		// Only tests construct the service without a source provider; production
+		// scans the enabled sources instead of every mounted account.
 		mounts, err := s.drive.Mounts(ctx)
 		if err != nil {
 			return first, queued, err
@@ -323,14 +330,6 @@ func (s *Service) EnqueueTargetedScan(ctx context.Context, tx *ent.Tx, source do
 		})
 	})
 	return taskRecord.ID, nil
-}
-
-func libraryScope(source *domain.LibrarySource) predicate.File {
-	local := file.AccountIDEQ(domain.LocalAccountID)
-	if source != nil {
-		return file.Or(database.LibraryFiles(*source), local)
-	}
-	return local
 }
 
 // StartIncrementalSync queues an incremental scan for every enabled source.
@@ -634,10 +633,22 @@ func (s *Service) markSubtitleStatus(ctx context.Context, movies []Movie) error 
 		return fmt.Errorf("read library subtitle files: %w", err)
 	}
 	for _, record := range files {
-		if record.MovieID != nil && subtitlemeta.HasChineseSubtitle(record.Name) {
-			if item, ok := index[*record.MovieID]; ok {
-				item.HasSubtitle = true
-			}
+		if record.MovieID == nil {
+			continue
+		}
+		item, ok := index[*record.MovieID]
+		if !ok {
+			continue
+		}
+		if subtitlemeta.HasChineseSubtitle(record.Name) {
+			item.HasSubtitle = true
+		}
+		inf := magnet.Infer(record.Name)
+		if inf.HasUncensored {
+			item.HasUncensored = true
+		}
+		if inf.HasCracked {
+			item.HasCracked = true
 		}
 	}
 	tracks, err := s.database.Subtitle.Query().

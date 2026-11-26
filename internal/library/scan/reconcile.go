@@ -6,18 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"entgo.io/ent/dialect/sql"
-	"entgo.io/ent/dialect/sql/sqljson"
 	"github.com/ppxb/miyabi/internal/database"
 	"github.com/ppxb/miyabi/internal/domain"
 	"github.com/ppxb/miyabi/internal/ent"
 	"github.com/ppxb/miyabi/internal/ent/file"
 	"github.com/ppxb/miyabi/internal/ent/movie"
 	"github.com/ppxb/miyabi/internal/ent/predicate"
-	"github.com/ppxb/miyabi/internal/ent/task"
 	"github.com/ppxb/miyabi/internal/export"
 	mediaimage "github.com/ppxb/miyabi/internal/image"
 	"github.com/ppxb/miyabi/internal/library/scrape"
@@ -83,10 +82,18 @@ func (r *scanRun) cleanupReassignedExports(ctx context.Context, cfg export.Confi
 
 // Prepare only bounded pages of completed movies. Files that reconciliation
 // will delete must not participate in snapshot comparison or regenerated STRMs.
-func (r *scanRun) prepareReconcile(ctx context.Context, cfg export.Config) (map[int]time.Time, error) {
+func (r *scanRun) prepareReconcile(ctx context.Context, cfg export.Config) (_ map[int]time.Time, err error) {
 	if r.payload.Rebuild {
 		return nil, nil
 	}
+	// Exports rewritten before an error or cancellation look complete to the
+	// retry, so their codes must be saved even when preparation stops early.
+	saved := len(r.payload.ExportedCodes)
+	defer func() {
+		if err != nil && len(r.payload.ExportedCodes) > saved {
+			err = errors.Join(err, SaveScanProgress(context.WithoutCancel(ctx), r.scanner.db.Task, r.taskID, *r.payload))
+		}
+	}()
 	indexed := file.And(database.LibraryFiles(r.payload.Source), file.ScanIDEQ(r.payload.ScanID))
 	retained := file.And(database.LibraryFiles(r.payload.Source), file.Not(r.staleFiles()))
 	reusable := make(map[int]time.Time)
@@ -111,6 +118,17 @@ func (r *scanRun) prepareReconcile(ctx context.Context, cfg export.Config) (map[
 			if !scrape.SnapshotMatches(record, r.payload.Source) {
 				continue
 			}
+			// Incremental syncs only queue pending movies and never consult reusable
+			// ones. They restore missing exports, such as after the Emby directory
+			// changed, and leave repairing existing files to full scans.
+			if r.payload.Incremental {
+				if cfg.EmbyDir == "" {
+					continue
+				}
+				if _, err := os.Stat(export.EmbyMovieDir(cfg.EmbyDir, record.Code)); !os.IsNotExist(err) {
+					continue
+				}
+			}
 			cached, err := r.scanner.images.Exists(scrape.MovieArtwork(record))
 			if err != nil {
 				return nil, fmt.Errorf("check cached artwork: %w", err)
@@ -119,11 +137,22 @@ func (r *scanRun) prepareReconcile(ctx context.Context, cfg export.Config) (map[
 				continue
 			}
 			if cfg.EmbyDir != "" {
-				if _, err := scrape.ExportLocalMovie(cfg.EmbyDir, cfg.PublicURL, cfg.STRMToken, record, r.scanner.images); err != nil {
+				// A failed export still reports the files it rewrote first.
+				changed, err := scrape.ExportLocalMovie(cfg.EmbyDir, cfg.PublicURL, cfg.STRMToken, record, r.scanner.images)
+				if changed && !slices.Contains(r.payload.ExportedCodes, record.Code) {
+					r.payload.ExportedCodes = append(r.payload.ExportedCodes, record.Code)
+				}
+				if err != nil {
 					return nil, fmt.Errorf("export local movie %s: %w", record.Code, err)
 				}
 			}
 			reusable[record.ID] = record.UpdatedAt
+		}
+		if len(r.payload.ExportedCodes) > saved {
+			if err := SaveScanProgress(ctx, r.scanner.db.Task, r.taskID, *r.payload); err != nil {
+				return nil, err
+			}
+			saved = len(r.payload.ExportedCodes)
 		}
 		after = records[len(records)-1].ID
 	}
@@ -197,65 +226,36 @@ func (r *scanRun) reconcileTx(ctx context.Context, tx *ent.Tx, cfg export.Config
 		if len(records) == 0 {
 			break
 		}
-		builders := make([]*ent.TaskCreate, 0, len(records))
-		keys := make([]string, len(records))
-		for i, record := range records {
-			keys[i] = fmt.Sprintf("movie:%d", record.ID)
+		jobs := make([]ScrapeJob, 0, len(records))
+		byID := make(map[int]ScrapeJob, len(records))
+		for _, record := range records {
+			job := ScrapeJob{
+				Rebuild: r.payload.Rebuild, Source: r.payload.Source, ScanTaskID: r.taskID,
+				MovieID: record.ID, Code: record.Code, ManualCode: record.ManualCode,
+			}
+			jobs = append(jobs, job)
+			byID[record.ID] = job
 		}
-		var active []struct {
-			ID          int    `json:"id"`
-			ResourceKey string `json:"resource_key"`
-			ParentID    int    `json:"parent_id"`
-		}
-		if err := tx.Task.Query().Where(task.TypeEQ(string(tasks.KindScrape)), task.ResourceKeyIn(keys...),
-			task.StatusIn(task.StatusQueued, task.StatusRunning), func(s *sql.Selector) {
-				if r.payload.Rebuild {
-					s.Where(sqljson.ValueEQ(task.FieldPayload, true, sqljson.Path("rebuild")))
-				}
-				// Publication checkpoints can precede the queue's final status update.
-				// Such a task can no longer pick up files found by this scan.
-				s.Where(sql.ExprP("coalesce(" + tasks.JSONExtract(s.C(task.FieldPayload), "completed") + ", 0) = 0"))
-				s.Where(sql.And(sqljson.ValueEQ(task.FieldPayload, r.payload.Source.AccountID, sqljson.Path("source", "account_id")),
-					sqljson.ValueEQ(task.FieldPayload, r.payload.Source.Directory.ID, sqljson.Path("source", "directory", "id"))))
-				s.Select(s.C(task.FieldID), s.C(task.FieldResourceKey), sql.As(tasks.JSONExtract(s.C(task.FieldPayload), "scan_task_id"), "parent_id"))
-			}).Order(task.ByID()).Select(task.FieldID).Scan(ctx, &active); err != nil {
+		plan, err := PlanScrapes(ctx, tx, jobs, ScanScrapePolicy)
+		if err != nil {
 			return err
 		}
-		byKey := make(map[string]int, len(active))
-		for i, item := range active {
-			if _, found := byKey[item.ResourceKey]; !found {
-				byKey[item.ResourceKey] = i
-			}
-		}
+		builders := make([]*ent.TaskCreate, 0, len(plan.Create))
 		for _, record := range records {
-			if index, found := byKey[fmt.Sprintf("movie:%d", record.ID)]; found {
-				item := active[index]
-				if item.ParentID != r.taskID {
-					r.payload.ReusedTasks = append(r.payload.ReusedTasks, item.ID)
+			if item, reused := plan.Reused[record.ID]; reused {
+				if item.ScanTaskID != r.taskID {
+					r.payload.ReusedTasks = append(r.payload.ReusedTasks, item.TaskID)
 				}
 				continue
 			}
 			if checked, ok := reusable[record.ID]; ok && checked.Equal(record.UpdatedAt) {
-				if cfg.EmbyDir != "" && r.scanner.notifier != nil {
-					// Also notify on a retry that finds complete exports: a previous
-					// attempt may have written them before its database commit failed.
-					if err := r.scanner.notifier.NotifyUpdatedTx(ctx, tx, export.EmbyMovieDir(cfg.EmbyDir, record.Code)); err != nil {
-						return err
-					}
-				}
 				continue
 			}
-			input := scrape.MetadataPayload{
-				Rebuild: r.payload.Rebuild,
-				Source:  r.payload.Source, ScanTaskID: r.taskID, MovieID: record.ID,
-				Code: record.Code, ManualCode: record.ManualCode,
-			}
-			encoded, err := tasks.EncodePayload(input)
+			create, err := NewScrapeTask(tx, byID[record.ID])
 			if err != nil {
 				return err
 			}
-			builders = append(builders, tx.Task.Create().SetType(tasks.KindScrape.String()).SetPayload(encoded).
-				SetResourceKey(fmt.Sprintf("movie:%d", record.ID)))
+			builders = append(builders, create)
 		}
 		if len(builders) > 0 {
 			if err := tx.Task.CreateBulk(builders...).Exec(ctx); err != nil {
@@ -265,6 +265,16 @@ func (r *scanRun) reconcileTx(ctx context.Context, tx *ent.Tx, cfg export.Config
 		}
 		after = records[len(records)-1].ID
 	}
+	// Only rewritten exports need a refresh. The list includes exports a
+	// previous attempt wrote before its database commit failed.
+	if cfg.EmbyDir != "" && r.scanner.notifier != nil {
+		for _, code := range r.payload.ExportedCodes {
+			if err := r.scanner.notifier.NotifyUpdatedTx(ctx, tx, export.EmbyMovieDir(cfg.EmbyDir, code)); err != nil {
+				return err
+			}
+		}
+	}
+	r.payload.ExportedCodes = nil
 	r.payload.Scan.Stage = "done"
 	if err := SaveScanProgress(ctx, tx.Task, r.taskID, *r.payload); err != nil {
 		return err

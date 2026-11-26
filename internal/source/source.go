@@ -3,7 +3,6 @@ package source
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"strings"
 
@@ -37,15 +36,9 @@ type Service struct {
 	mounts MountProvider
 }
 
-// LocalTarget is an enabled local source directory and its metadata mode.
-type LocalTarget struct {
-	Path         string
-	MetadataOnly bool
-}
-
-// MountProvider resolves a 115 account's mounted directory.
+// MountProvider lists every mounted 115 account directory.
 type MountProvider interface {
-	Mount(context.Context, string) (domain.LibrarySource, bool, error)
+	Mounts(context.Context) ([]domain.LibrarySource, error)
 }
 
 // New creates the source service; mounts resolves 115 account mount directories.
@@ -102,12 +95,19 @@ func (s *Service) Replace(ctx context.Context, sources []Source) ([]Source, erro
 }
 
 // LibrarySources returns the enabled 115 sources that have a mounted directory.
-// An account whose mount cannot be read is logged and skipped so it does not
-// block the other accounts.
+// Mounts are read once and matched by account id.
 func (s *Service) LibrarySources(ctx context.Context) ([]domain.LibrarySource, error) {
 	sources, err := s.List(ctx)
 	if err != nil {
 		return nil, err
+	}
+	mounted, err := s.mounts.Mounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	byAccount := make(map[string]domain.LibrarySource, len(mounted))
+	for _, mount := range mounted {
+		byAccount[mount.AccountID] = mount
 	}
 	result := make([]domain.LibrarySource, 0)
 	for _, src := range sources {
@@ -118,12 +118,7 @@ func (s *Service) LibrarySources(ctx context.Context) ([]domain.LibrarySource, e
 		if accountID == "" {
 			continue
 		}
-		mount, ok, err := s.mounts.Mount(ctx, accountID)
-		if err != nil {
-			slog.WarnContext(ctx, "skip 115 source with unreadable mount", "account", accountID, "error", err)
-			continue
-		}
-		if ok {
+		if mount, ok := byAccount[accountID]; ok {
 			result = append(result, mount)
 		}
 	}
@@ -131,18 +126,18 @@ func (s *Service) LibrarySources(ctx context.Context) ([]domain.LibrarySource, e
 }
 
 // LocalTargets returns the enabled local source directories with their mode.
-func (s *Service) LocalTargets(ctx context.Context) ([]LocalTarget, error) {
+func (s *Service) LocalTargets(ctx context.Context) ([]domain.LocalScanTarget, error) {
 	sources, err := s.List(ctx)
 	if err != nil {
 		return nil, err
 	}
-	targets := make([]LocalTarget, 0)
+	targets := make([]domain.LocalScanTarget, 0)
 	for _, src := range sources {
 		if src.Kind != KindLocal || !src.Enabled {
 			continue
 		}
 		if path := strings.TrimSpace(src.Config["path"]); path != "" {
-			targets = append(targets, LocalTarget{Path: path, MetadataOnly: localMetadataOnly(src)})
+			targets = append(targets, domain.LocalScanTarget{Path: path, MetadataOnly: localMetadataOnly(src)})
 		}
 	}
 	return targets, nil
